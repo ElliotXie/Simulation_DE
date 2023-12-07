@@ -1,0 +1,364 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#library
+```{r}
+library(dplyr)
+library(Libra)
+library(VennDiagram)
+library(ggplot2)
+library(UpSetR)
+library(limma)
+library(Seurat)
+library(LibraC)  #Enhanced libra, I only changed the name
+library(ggvenn)
+
+```
+
+
+#Simulation helper function
+```{r}
+
+##function to simulate the data
+
+simulate_expression_data_to_seurat_possion_random_add_detail2 <- function(n_genes, n_samples_A, n_samples_B, n_cells_per_sample, de_fraction, logfc, min_mean = 1, max_mean = 20, random_effects_A, random_effects_B) {
+  library(Seurat)
+  set.seed(123) # Set a seed for reproducibility
+  
+  # Ensure that the length of random effects matches the number of samples
+  if(length(random_effects_A) != n_samples_A || length(random_effects_B) != n_samples_B) {
+    stop("Length of random effects vectors does not match the number of samples")
+  }
+  
+  # Calculate the total number of cells for each condition
+  n_cells_A <- n_samples_A * n_cells_per_sample
+  n_cells_B <- n_samples_B * n_cells_per_sample
+  n_cells_total <- n_cells_A + n_cells_B
+  
+  # Number of DE genes
+  n_de_genes <- round(n_genes * de_fraction)
+  
+  # Generate random means (lambda) for each gene for Poisson distribution
+  gene_means <- runif(n_genes, min = min_mean, max = max_mean)
+  
+  # Initialize matrix to hold the gene expression data
+  expression_data <- matrix(nrow = n_cells_total, ncol = n_genes)
+
+  # Initialize matrices to store pre-random effect gene means for each sample
+  pre_effect_means_A <- matrix(nrow = n_samples_A, ncol = n_genes)
+  pre_effect_means_B <- matrix(nrow = n_samples_B, ncol = n_genes)
+  
+  # Simulate gene expression data for each gene using Poisson distribution with additive random effects
+  for (gene in 1:n_genes) {
+    for (sample in 1:n_samples_A) {
+      start_idx <- (sample - 1) * n_cells_per_sample + 1
+      end_idx <- sample * n_cells_per_sample
+      lambda_A <- gene_means[gene] + random_effects_A[sample]
+      # Store pre-random effect means
+      pre_effect_means_A[sample, gene] <- gene_means[gene]
+      expression_data[start_idx:end_idx, gene] <- rpois(n = n_cells_per_sample, lambda = lambda_A)
+    }
+    for (sample in 1:n_samples_B) {
+      start_idx <- n_cells_A + (sample - 1) * n_cells_per_sample + 1
+      end_idx <- n_cells_A + sample * n_cells_per_sample
+      lambda_B <- gene_means[gene] + random_effects_B[sample]
+      # Store pre-random effect means
+      pre_effect_means_B[sample, gene] <- gene_means[gene]
+      expression_data[start_idx:end_idx, gene] <- rpois(n = n_cells_per_sample, lambda = lambda_B)
+    }
+  }
+  
+  # Assign the first n_de_genes as DE genes
+  de_genes <- 1:n_de_genes
+  up_genes <- 1:(n_de_genes/2)
+  down_genes <- (n_de_genes/2 + 1):n_de_genes
+  
+  # Apply fold changes to upregulated and downregulated genes
+  fc_multiplier_up <- exp(logfc)
+  fc_multiplier_down <- exp(-logfc)
+  for (gene in up_genes) {
+    expression_data[(n_cells_A + 1):n_cells_total, gene] <-
+      expression_data[(n_cells_A + 1):n_cells_total, gene] * fc_multiplier_up
+  }
+  for (gene in down_genes) {
+    expression_data[(n_cells_A + 1):n_cells_total, gene] <-
+      expression_data[(n_cells_A + 1):n_cells_total, gene] * fc_multiplier_down
+  }
+
+  # Convert to data frames and set row names
+  expression_df_A <- as.data.frame(t(expression_data[1:n_cells_A, ]))
+  expression_df_B <- as.data.frame(t(expression_data[(n_cells_A + 1):n_cells_total, ]))
+  rownames(expression_df_A) <- paste0("Gene", 1:n_genes)
+  rownames(expression_df_B) <- paste0("Gene", 1:n_genes)
+  
+  # Create Seurat objects and add metadata
+  seurat_obj_A <- CreateSeuratObject(counts = expression_df_A)
+  seurat_obj_B <- CreateSeuratObject(counts = expression_df_B)
+  
+  seurat_obj_A$Sample <- rep(paste0("Sample_A_", seq_len(n_samples_A)), each = n_cells_per_sample)
+  seurat_obj_B$Sample <- rep(paste0("Sample_B_", seq_len(n_samples_B)), each = n_cells_per_sample)
+  
+  seurat_obj_A$group <- rep("A", n_cells_A)
+  seurat_obj_B$group <- rep("B", n_cells_B)
+  
+  # Return the Seurat objects, DE gene lists, and pre-effect means
+  return(list(A = seurat_obj_A, B = seurat_obj_B, de = de_genes, up = up_genes, down = down_genes, pre_effect_means_A = pre_effect_means_A, pre_effect_means_B = pre_effect_means_B))
+}
+
+
+
+```
+
+
+```{r}
+##function to convert the simulated data
+
+processSeuratObjects <- function(seuratObj) {
+  # Extract Seurat Objects for condition A and B, and the list of true DE genes
+  a <- seuratObj$A
+  b <- seuratObj$B
+  truede <- seuratObj$de
+  
+  # Merge Seurat objects
+  combined <- merge(a, b)
+  combined$cell_type <- "uni"
+  combined$replicate <- combined$Sample
+  combined$label <- combined$group
+  
+  return(combined)
+}
+```
+
+
+```{r}
+
+##function to run de analysis (without bootbulk)
+
+run_all_de_analysis_iso <- function(combined,mixed_method) {
+  # Run differential expression analysis for each family and create Venn diagrams
+  venn_diagrams <- list()
+  
+  # Single cell DE
+  DE_singlecell <- run_de(abs(combined@assays$RNA@counts), meta = combined@meta.data, de_family = "singlecell", de_method = "wilcox")
+  DE_singlecell <- DE_singlecell %>% filter(p_val_adj < 0.05)
+  venn_diagrams$singlecell <- create_venn_diagram(DE_singlecell$gene, truede, label_genelist = "Single Cell")
+  
+  # Pseudobulk DESeq2
+  DE_deseq2 <- run_de(abs(round(combined@assays$RNA@counts)), meta = combined@meta.data,de_family = "pseudobulk", de_method = "DESeq2", de_type = "LRT")
+  DE_deseq2 <- DE_deseq2 %>% filter(p_val_adj < 0.05)
+  venn_diagrams$pseudobulk <- create_venn_diagram(DE_deseq2$gene, truede, label_genelist = "Pseudobulk DESeq2")
+  
+  # Mixed effects model
+  DE_mix <- run_de(combined, de_family = "mixedmodel", de_method = mixed_method, de_type = "LRT")
+  
+  DE_mix <- DE_mix %>% filter(p_val_adj < 0.05)
+  venn_diagrams$mixed <- create_venn_diagram(DE_mix$gene, truede, label_genelist = "Mixed Effects Model")
+  
+  # Store the DE analysis results
+  de_results <- list(
+    singlecell = DE_singlecell,
+    pseudobulk = DE_deseq2,
+    mixed = DE_mix
+  )
+  
+  # Store the combined data as well
+  de_results$data <- combined
+  
+  # Return both DE results and Venn diagram plots
+  return(list(results = de_results, venn = venn_diagrams))
+}
+
+```
+
+
+
+
+```{r}
+
+##function to run de with bootbulk
+##note that LibraC::run_de, the run_de for bootbulk is from the enhanced libra function, while run_de for other de method is from the original package.
+
+n_bootsmapling.func <- function(n){
+  # return(1)
+  # return(round(log10(n)))
+  # return(round(log2(n)))
+  return(round(sqrt(n)))
+  #return(n)
+  # return(2*n)
+  #return(3*n)
+}
+
+run_all_de_analysis_iso_boot <- function(combined, mixed_method, n_bootsampling) {
+  # Run differential expression analysis for each family and create Venn diagrams
+  venn_diagrams <- list()
+  
+  # Single cell DE
+  DE_singlecell <- run_de(abs(combined@assays$RNA@counts), meta = combined@meta.data, de_family = "singlecell", de_method = "wilcox")
+  DE_singlecell <- DE_singlecell %>% filter(p_val_adj < 0.05)
+  venn_diagrams$singlecell <- create_venn_diagram(DE_singlecell$gene, truede, label_genelist = "Single Cell")
+  
+  # Pseudobulk DESeq2
+  DE_deseq2 <- run_de(abs(round(combined@assays$RNA@counts)), meta = combined@meta.data, de_family = "pseudobulk", de_method = "DESeq2", de_type = "LRT")
+  DE_deseq2 <- DE_deseq2 %>% filter(p_val_adj < 0.05)
+  venn_diagrams$pseudobulk <- create_venn_diagram(DE_deseq2$gene, truede, label_genelist = "Pseudobulk DESeq2")
+  
+  # Mixed effects model
+  DE_mix <- run_de(combined, de_family = "mixedmodel", de_method = mixed_method, de_type = "LRT")
+  DE_mix <- DE_mix %>% filter(p_val_adj < 0.05)
+  venn_diagrams$mixed <- create_venn_diagram(DE_mix$gene, truede, label_genelist = "Mixed Effects Model")
+
+  # Bootbulk DE using limma with trend method
+  DE_bootbulk_limma_trend <- LibraC::run_de(input = combined, 
+                                         de_family = "bootbulk", 
+                                         aggr_method = "sum",
+                                         n_sample_aggr = n_bootsmapling.func,
+                                         corr_sampling = 0.5,
+                                         de_method = 'limma', 
+                                         de_type = 'trend')
+  
+  DE_bootbulk_limma_trend <- DE_bootbulk_limma_trend %>% filter(p_val_adj < 0.05)
+  venn_diagrams$bootbulk_limma_trend <- create_venn_diagram(DE_bootbulk_limma_trend$gene, truede, label_genelist = "Bootbulk Limma Trend")
+
+  # Store the DE analysis results
+  de_results <- list(
+    singlecell = DE_singlecell,
+    pseudobulk = DE_deseq2,
+    mixed = DE_mix,
+    bootbulk_limma_trend = DE_bootbulk_limma_trend
+  )
+  
+  # Store the combined data as well
+  de_results$data <- combined
+  
+  # Return both DE results and Venn diagram plots
+  return(list(results = de_results, venn = venn_diagrams))
+}
+
+```
+
+
+
+
+```{r}
+
+#visualization helper function
+
+create_venn_diagram <- function(genelist, ground_truth, label_genelist = "DESEQ2", label_ground_truth = "GroundTruth") {
+  # Clean up the gene names if needed; remove 'Gene' prefix
+  genelist <- sub("Gene", "", genelist)
+  ground_truth <- sub("Gene", "", ground_truth)
+  
+  # Convert vectors to a list with custom labels
+  list_of_vectors <- list()
+  list_of_vectors[[label_genelist]] <- genelist
+  list_of_vectors[[label_ground_truth]] <- ground_truth
+  
+  # Use ggvenn to create the Venn diagram
+  venn_plot <- ggvenn(list_of_vectors)
+  
+  # Return the Venn diagram plot object
+  return(venn_plot)
+}
+```
+
+
+
+
+#run the simulation without bootbulk
+```{r}
+seurat3 <- simulate_expression_data_to_seurat_possion_random_add_detail2(n_genes = 5000, n_samples_A = 3, n_samples_B = 3, n_cells_per_sample = 50, de_fraction = 0.1, logfc = 1,min_mean = 1, max_mean = 20, random_effects_A =c(0,0,0),random_effects_B=c(0,0,2))
+
+
+truede=seurat3$de
+combined2=processSeuratObjects(seurat3)
+de3=run_all_de_analysis_iso(combined2,"linear")
+de3
+```
+
+
+#run the simulation with bootbulk
+```{r}
+seurat3 <- simulate_expression_data_to_seurat_possion_random_add_detail2(n_genes = 5000, n_samples_A = 3, n_samples_B = 3, n_cells_per_sample = 50, de_fraction = 0.1, logfc = 1,min_mean = 1, max_mean = 20, random_effects_A =c(0,0,0),random_effects_B=c(0,0,1))
+
+
+truede=seurat3$de
+combined2=processSeuratObjects(seurat3)
+de3=run_all_de_analysis_iso_boot(combined2,"linear")
+de3
+```
+
+
+
+# more simulation with bootbulk
+
+```{r}
+# Define a function to run a test scenario
+run_test_scenario <- function(n_samples_A, n_samples_B, n_cells_per_sample, logfc, random_effects_range) {
+  random_effects_A <- sample(random_effects_range, n_samples_A, replace = TRUE)
+  random_effects_B <- sample(random_effects_range, n_samples_B, replace = TRUE)
+  
+  seurat_obj <- simulate_expression_data_to_seurat_possion_random_add_detail2(
+    n_genes = 5000, 
+    n_samples_A = n_samples_A, 
+    n_samples_B = n_samples_B, 
+    n_cells_per_sample = n_cells_per_sample, 
+    de_fraction = 0.1, 
+    logfc = logfc,
+    min_mean = 1, 
+    max_mean = 20, 
+    random_effects_A = random_effects_A,
+    random_effects_B = random_effects_B
+  )
+  
+  combined <- processSeuratObjects(seurat_obj)
+  de_results <- run_all_de_analysis_iso_boot(combined, "linear")
+  
+  return(de_results)
+}
+
+# Example: Run a scenario with 3 vs 3 samples, 50 cells/sample, low logfc, and low random effect
+example_results <- run_test_scenario(
+  n_samples_A = 3, 
+  n_samples_B = 3, 
+  n_cells_per_sample = 50, 
+  logfc = 0.5, 
+  random_effects_range = 0:2
+)
+
+# example_results will contain the DE analysis results for this scenario
+example_results$venn
+```
+
+```{r}
+# Define the scenarios
+sample_sizes <- list(small = c(3, 3), unbalanced = c(5, 10))
+cell_counts <- c(50, 500)
+logfc_levels <- c(0.5, 1)
+random_effect_levels <- list(low = 0:2, high = 0:7)
+
+# Loop over scenarios
+results <- list()
+for (size in names(sample_sizes)) {
+  for (cells in cell_counts) {
+    for (logfc in logfc_levels) {
+      for (effect in names(random_effect_levels)) {
+        scenario_label <- paste(size, cells, "cells", logfc, "logfc", effect, "random_effect", sep = "_")
+        results[[scenario_label]] <- run_test_scenario(
+          n_samples_A = sample_sizes[[size]][1],
+          n_samples_B = sample_sizes[[size]][2],
+          n_cells_per_sample = cells,
+          logfc = logfc,
+          random_effects_range = random_effect_levels[[effect]]
+        )
+      }
+    }
+  }
+}
+
+# results is a list containing DE analysis results for each scenario
+
+```
+
+
